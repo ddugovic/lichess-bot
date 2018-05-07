@@ -1,9 +1,182 @@
+import logging
 import os
+import stat
 import chess
 import chess.xboard
 import chess.uci
 import backoff
 import subprocess
+import time
+import threading
+import sys
+import platform
+import requests
+
+STOCKFISH_RELEASES = "https://api.github.com/repos/niklasf/Stockfish/releases/latest"
+HTTP_TIMEOUT = 15.0
+
+def open_process(command, cwd=None, shell=True, _popen_lock=threading.Lock()):
+    kwargs = {
+        "shell": shell,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.PIPE,
+        "bufsize": 1,  # Line buffered
+        "universal_newlines": True,
+    }
+
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+
+    # Prevent signal propagation from parent process
+    try:
+        # Windows
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    except AttributeError:
+        # Unix
+        kwargs["preexec_fn"] = os.setpgrp
+
+    with _popen_lock:  # Work around Python 2 Popen race condition
+        return subprocess.Popen(command, **kwargs)
+
+
+def detect_cpu_capabilities():
+    # Detects support for popcnt and pext instructions
+    vendor, modern, bmi2 = "", False, False
+
+    # Run cpuid in subprocess for robustness in case of segfaults
+    cmd = []
+    cmd.append(sys.executable)
+    if __package__ is not None:
+        cmd.append("-m")
+        cmd.append(os.path.splitext(os.path.basename(__file__))[0])
+    else:
+        cmd.append(__file__)
+    cmd.append("cpuid")
+
+    process = open_process(cmd, shell=False)
+
+    # Parse output
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            break
+
+        line = line.rstrip()
+        logging.debug("cpuid >> %s", line)
+        if not line:
+            continue
+
+        columns = line.split()
+        if columns[0] == "CPUID":
+            pass
+        elif len(columns) == 5 and all(all(c in string.hexdigits for c in col) for col in columns):
+            eax, a, b, c, d = [int(col, 16) for col in columns]
+
+            # vendor
+            if eax == 0:
+                vendor = struct.pack("III", b, d, c).decode("utf-8")
+
+            # popcnt
+            if eax == 1 and c & (1 << 23):
+                modern = True
+
+            # pext
+            if eax == 7 and b & (1 << 8):
+                bmi2 = True
+        else:
+            logging.warning("Unexpected cpuid output: %s", line)
+
+    # Done
+    process.communicate()
+    if process.returncode != 0:
+        logging.error("cpuid exited with status code %d", process.returncode)
+
+    return vendor, modern, bmi2
+
+
+def stockfish_filename():
+    machine = platform.machine().lower()
+
+    vendor, modern, bmi2 = detect_cpu_capabilities()
+    if modern and "Intel" in vendor and bmi2:
+        suffix = "-bmi2"
+    elif modern:
+        suffix = "-modern"
+    else:
+        suffix = ""
+
+    if os.name == "nt":
+        return "stockfish-windows-%s%s.exe" % (machine, suffix)
+    elif os.name == "os2" or sys.platform == "darwin":
+        return "stockfish-osx-%s" % machine
+    elif os.name == "posix":
+        return "stockfish-%s%s" % (machine, suffix)
+
+
+def download_github_release(config):
+    cfg = config["engine"]
+    path = os.path.join(cfg["dir"], cfg["name"])
+    logging.info("Engine target path: %s", path)
+    filename = stockfish_filename();
+
+    headers = {}
+
+    # Only update to newer versions
+    try:
+        headers["If-Modified-Since"] = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(os.path.getmtime(path)))
+    except OSError:
+        pass
+
+    # Escape GitHub API rate limiting
+    if "GITHUB_API_TOKEN" in os.environ:
+        headers["Authorization"] = "token %s" % os.environ["GITHUB_API_TOKEN"]
+
+    # Find latest release
+    logging.info("Looking up %s ...", filename)
+
+    response = requests.get(STOCKFISH_RELEASES, headers=headers, timeout=HTTP_TIMEOUT)
+    if response.status_code == 304:
+        logging.info("Local %s is newer than release", filename)
+        return filename
+
+    release = response.json()
+
+    logging.info("Latest release is tagged %s", release["tag_name"])
+
+    for asset in release["assets"]:
+        if asset["name"] == filename:
+            logging.info("Found %s" % asset["browser_download_url"])
+            break
+    else:
+        raise ConfigError("No precompiled %s for your platform" % filename)
+
+    # Download
+    logging.info("Downloading %s ...", filename)
+
+    download = requests.get(asset["browser_download_url"], stream=True, timeout=HTTP_TIMEOUT)
+    progress = 0
+    size = int(download.headers["content-length"])
+    with open(path, "wb") as target:
+        for chunk in download.iter_content(chunk_size=1024):
+            target.write(chunk)
+            progress += len(chunk)
+
+            if sys.stderr.isatty():
+                sys.stderr.write("\rDownloading %s: %d/%d (%d%%)" % (
+                                    filename, progress, size,
+                                    progress * 100 / size))
+                sys.stderr.flush()
+    if sys.stderr.isatty():
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    # Make executable
+    logging.info("chmod +x %s", filename)
+    st = os.stat(path)
+    os.chmod(path, st.st_mode | stat.S_IEXEC)
+    return filename
+
 
 @backoff.on_exception(backoff.expo, BaseException, max_time=120)
 def create_engine(config, board):
