@@ -246,7 +246,10 @@ class UCIEngine(EngineWrapper):
         if options:
             self.engine.setoption(options)
 
+        if type(board).uci_variant == "giveaway":
+            self.engine.setoption({"Contempt": 20, "Move Overhead": 100})
         self.engine.setoption({
+            "Contempt": 100,
             "UCI_Variant": type(board).uci_variant,
             "UCI_Chess960": board.chess960
         })
